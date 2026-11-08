@@ -2,12 +2,8 @@ from pyhtn.common.imports.typing import *
 from abc import ABC, abstractmethod
 from pyhtn.htn.htn_elements import Task, Method, Operator, HTN_Element
 from pyhtn.common.utils import unique_hash
-
-from pyhtn.conditions.pattern_matching import (
-    dict_to_tuple,
-)
-
-from py_plan.pattern_matching import build_index
+from pyhtn.htn.matching import to_factset, head_binding, any_match
+from cre import FactSet
 from enum import Enum
 
 class ExStatus(Enum):
@@ -21,7 +17,7 @@ class ExStatus(Enum):
 class ElementExecution(ABC):
     def __init__(self,
                  element: HTN_Element,
-                 state: List[dict],
+                 state: FactSet,
                  match: Sequence[Any] = (),
                  parent_exec: Any = None,
                  child_execs: Sequence["ElementExecution"] = [],
@@ -39,8 +35,10 @@ class ElementExecution(ABC):
         if(self.parent_exec is not None):
             self.parent_exec.id
 
+        state = self.state
+        state_hash = state.long_hash() if isinstance(state, FactSet) else state
         return unique_hash([
-            self.element.id, self.state, self.match, parent_id
+            self.element.id, state_hash, self.match, parent_id
         ])
 
     def _str_helper(self, kind):
@@ -97,6 +95,9 @@ class ElementExecution(ABC):
     def fn_str(self):
         return f"{self.element.name}({', '.join([str(x) for x in self.match])})"
 
+def _match_str(match):
+    return ', '.join([str(x) for x in match])
+
 def _dict_obj_to_str(tree_dict, obj, options={}, recurse=True,  depth=0):
 
     cpre = ""
@@ -114,7 +115,7 @@ def _dict_obj_to_str(tree_dict, obj, options={}, recurse=True,  depth=0):
     s = ""
     if(obj['kind'] == "TaskEx"):
         prim = obj.get('is_primitive', False)
-        s = f"{cpre}{' '*depth}TE{'-P' if prim else '  '}: {obj['name']}({', '.join(obj['match'])}){cpost}\n"
+        s = f"{cpre}{' '*depth}TE{'-P' if prim else '  '}: {obj['name']}({_match_str(obj['match'])}){cpost}\n"
         for child_id in obj['child_ids']:
             child = tree_dict[child_id]
             on_path = child['status'] in ("SUCCESS", "IN_PROGRESS")
@@ -125,7 +126,7 @@ def _dict_obj_to_str(tree_dict, obj, options={}, recurse=True,  depth=0):
 
     elif(obj['kind'] == "MethodEx"):
         if(options.get("show_methods", False)):
-            s = f"{cpre}{' '*depth}ME  : {obj['name']}({', '.join(obj['match'])}){cpost}\n"
+            s = f"{cpre}{' '*depth}ME  : {obj['name']}({_match_str(obj['match'])}){cpost}\n"
         for child_id in obj['child_ids']:
             child = tree_dict[child_id]
             on_path = child['status'] in ("SUCCESS", "IN_PROGRESS")
@@ -133,7 +134,7 @@ def _dict_obj_to_str(tree_dict, obj, options={}, recurse=True,  depth=0):
                     recurse=on_path, depth=depth+1)        
     elif(obj['kind'] == "OperatorEx"):
         if(options.get("show_operators", False)):
-            s = f"{cpre}{' '*depth}OE : {obj['name']}({', '.join(obj['match'])}){cpost}\n"
+            s = f"{cpre}{' '*depth}OE : {obj['name']}({_match_str(obj['match'])}){cpost}\n"
 
     return s
 
@@ -157,7 +158,7 @@ def tree_dict_to_str(tree_dict, show_colors=True,
 class TaskEx(ElementExecution):
     def __init__(self,
                  task: Task,
-                 state: List[dict],
+                 state: FactSet,
                  match: Sequence[Any] = (),
                  parent_method_exec: Any = None,
                  child_method_execs: Sequence["MethodEx"] = [],                 
@@ -220,16 +221,24 @@ class TaskEx(ElementExecution):
         if(t.optional):
             can_skip = True
 
-        # The rest... 
-        elif(preconditions:=t.optional_if or t.skip_if or t.block_if):
-            matches = t._get_match_substitutions(self, state, preconditions)
-            if(len(matches) > 0):
-                if(t.optional_if):
+        # The rest... A condition is checked with the Task's own args
+        #  bound to this TaskEx's match values.
+        else:
+            for kind in ('optional_if', 'skip_if', 'block_if'):
+                cond = getattr(t, kind)
+                if(cond is not None):
+                    break
+            else:
+                return can_execute, can_skip
+
+            binding = head_binding(t.args, self.match, skip_derefs=True) or {}
+            if(any_match(cond, to_factset(state), binding)):
+                if(kind == 'optional_if'):
                     can_skip = True
-                elif(t.skip_if):
+                elif(kind == 'skip_if'):
                     can_skip = True
                     can_execute = False
-                elif(t.block_if):
+                elif(kind == 'block_if'):
                     can_execute = False
 
         return can_execute, can_skip
@@ -248,7 +257,7 @@ class TaskEx(ElementExecution):
 class MethodEx(ElementExecution):
     def __init__(self,
                  method: Method,
-                 state: List[dict],
+                 state: FactSet,
                  match: Sequence[Any] = (),
                  parent_task_exec: Any = None,
                  subtask_execs: Sequence[TaskEx] = [],
@@ -280,7 +289,7 @@ class MethodEx(ElementExecution):
 class OperatorEx(ElementExecution):
     def __init__(self,
                  operator: Operator,
-                 state: List[dict],
+                 state: FactSet,
                  match: Sequence[Any] = (),
                  parent_task_exec: TaskEx = None,
                  ) -> None:

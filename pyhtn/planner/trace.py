@@ -40,7 +40,7 @@ class TraceEntry:
             kind: TraceKind,
             arg0=None,
             arg1=None):        
-        from pyhtn.htn.planner2 import FrameContext 
+        from pyhtn.htn.planner import FrameContext 
 
         self.kind = kind
         if(isinstance(arg0, FrameContext)):
@@ -297,4 +297,3 @@ class Trace:
             print(f"Showing last {max_entries} of {len(self.entries)} entries.")
         print("────────────────────────────────────────────────────")
 
-# Now I'll update the necessary functions in the HtnPlanner class

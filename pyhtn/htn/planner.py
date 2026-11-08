@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from pyhtn.common.imports.typing import *
 from pyhtn.htn import Task, Method, Operator, TaskEx, MethodEx, OperatorEx, ExStatus
+from pyhtn.htn.htn import HTN
+from pyhtn.htn.matching import to_factset
 
 # from pyhtn.domain.method import GroundedMethod
 # from pyhtn.domain.method import Method
@@ -968,14 +970,14 @@ class RootTaskQueue(TaskManager):
 
 
 
-class HtnPlanner2:
+class HTN_Planner:
     """
     This planner implements HTN (Hierarchical Task Network) planning using a graph of
     task, method, and operator nodes.
     """
 
     def __init__(self,
-                 domain: Dict[str, List[Method]],
+                 domain: Union[HTN, Dict[str, List[Method]]],
                  tasks: List[dict] = [],
                  env: Any = None,
                  validate_input: bool = False,
@@ -1005,7 +1007,7 @@ class HtnPlanner2:
 
         # Initialize instance variables
         self.env = env
-        self.state = self.env.get_state()
+        self.state = self._get_env_state()
 
         # Replace plan_list with trace
         self.trace = Trace()
@@ -1032,8 +1034,8 @@ class HtnPlanner2:
 
         self.planning_start_time = None
 
-        # Set domain network
-        self.domain_network = domain
+        # Set domain network (a dict domain is wrapped in an HTN)
+        self.domain_network = HTN.coerce(domain)
 
         # Create cursor to track planning state
         self.cursors = [Cursor()]
@@ -1067,13 +1069,21 @@ class HtnPlanner2:
             self.logger.info("Starting automated planning")
 
         if self.env and hasattr(self.env, 'get_state'):
-            self.state = self.env.get_state()
+            self.state = self._get_env_state()
 
         if(self.is_exhausted()):
             raise StopException("There are no tasks to plan for")
 
 
 
+
+    def _get_env_state(self):
+        ''' Get the environment's state as a cre FactSet. An environment may
+            return a FactSet directly, or a list of dicts with "type" keys.
+        '''
+        if self.env is None or not hasattr(self.env, 'get_state'):
+            return to_factset(None)
+        return to_factset(self.env.get_state())
 
     def _expand_taskex(self, task_exec, task_ind, cursor, push_nomatch_frames=False):
         ''' Handle the execution of a TaskEx instance
@@ -1370,7 +1380,7 @@ class HtnPlanner2:
         # print("-- APPLY:", operator_exec, " --")
         success = True
         if(self.env):
-            success = self.env._env_try_operator_exec(operator_exec)
+            success = self._env_try_operator_exec(operator_exec)
 
         if(success):
             self.trace.add(TraceKind.APPLY_OPERATOR, operator_exec)
@@ -1625,11 +1635,8 @@ class HtnPlanner2:
     #     self.domain_network[task_id].append(new_method)
     #     return new_method
 
-    def add_method(self, method: Method):   
-        task_id = str(method.name)
-        if task_id not in self.domain_network:
-            self.domain_network[task_id] = []
-        self.domain_network[task_id].append(method)
+    def add_method(self, method: Method, task: Optional[str] = None):
+        self.domain_network.add(method, task=task)
 
 
     def add_tasks(self, tasks: Union[
@@ -1755,8 +1762,6 @@ class HtnPlanner2:
         # Execute in environment if available
         # print(operator_exec)
 
-        state_before = deepcopy(self.state)
-        
         success = True
         if self.env:
             if self.enable_logging:
@@ -1788,10 +1793,7 @@ class HtnPlanner2:
 
         # Update planner state with environment state after applying operator
         if hasattr(self.env, 'get_state'):
-            self.state = self.env.get_state()
-            state_after = deepcopy(self.state)
-        else:
-            state_after = state_before
+            self.state = self._get_env_state()
 
         return success
             
