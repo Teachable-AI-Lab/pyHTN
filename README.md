@@ -288,12 +288,16 @@ Each `OperatorEx`, `MethodEx` and `TaskEx` links to its parent
 
 ### Known Limitations
 
-These are tracked by `xfail` tests in `tests/test_planner.py`:
+These are tracked by `xfail` tests in `tests/test_planner.py`. A proposed
+design for fixing them is in
+[docs/plans/multiheaded-reevaluation.md](docs/plans/multiheaded-reevaluation.md).
 
-- **Backtracking:** when an operator fails, the planner doesn't yet fall
-  back to the task's next method.
+- **Re-planning and operator failure:** calling `plan_to_next_operators()`
+  again without a successful `apply()` re-executes the pending operators
+  and crashes, instead of re-evaluating them against the current state.
+  Single-headed backtracking isn't implemented.
 - **Tasks with no matches:** a task with no matching method or operator
-  raises an error instead of backtracking.
+  raises an error, instead of dropping that branch.
 - **Single-headed and interactive planning:** `plan(multiheaded=False)` and
   `plan_to_next_decomposition()` don't work yet, so the interactive
   method-selection calls (`get_next_method_execs()`, `stage_method_exec()`,
