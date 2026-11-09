@@ -154,13 +154,80 @@ def test_multiple_root_tasks_all_run():
     assert sorted(env.log) == ["a", "b", "c"]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "Root tasks run in reverse order: RootTaskQueue.add() inserts every "
-    "priority='first' task at the front of the queue."))
 def test_root_tasks_run_in_order():
     env = Env()
     run_stepwise(make(ROOTS, [Task("S"), Task("T"), Task("U")], env))
     assert env.log == ["a", "b", "c"]
+
+
+def test_root_task_priorities():
+    # Lower rank runs sooner; equal priorities keep the order given.
+    env = Env()
+    tasks = [Task("S", priority="low"), Task("T", priority="high"),
+             Task("U", priority="high")]
+    run_stepwise(make(ROOTS, tasks, env))
+    assert env.log == ["b", "c", "a"]
+
+
+def test_added_first_priority_task_runs_next():
+    env = Env()
+    planner = make(ROOTS, [Task("S"), Task("T", priority="low")], env)
+    planner.add_tasks(Task("U", priority="first"))
+    run_stepwise(planner)
+    assert env.log == ["a", "c", "b"]
+
+
+def test_unknown_priority_raises():
+    with pytest.raises(ValueError, match="Unknown task priority"):
+        make(ROOTS, [Task("S", priority="urgent")], Env())
+
+
+def test_root_task_with_empty_method():
+    # The root's method has no subtasks: it finishes without any operator,
+    #  and planning moves on to the next root task.
+    env = Env()
+    htn = HTN(*ops, Method("S", subtasks=[]), Method("T", subtasks=[Task("b")]))
+    planner = make(htn, [Task("S"), Task("T")], env)
+    run_stepwise(planner)
+    assert env.log == ["b"]
+    assert planner.is_exhausted()
+
+
+def test_only_root_task_with_empty_method():
+    planner = make(HTN(*ops, Method("S", subtasks=[])), [Task("S")], Env())
+    planner.plan(multiheaded=True)
+    assert planner.is_exhausted()
+
+
+def test_root_task_is_operator():
+    env = Env()
+    run_stepwise(make(ROOTS, [Task("a"), Task("T"), Task("c")], env))
+    assert env.log == ["a", "b", "c"]
+
+
+def test_root_operator_stops_before_applying():
+    # plan_to_next_operators() returns a root operator instead of applying it.
+    env = Env()
+    planner = make(ROOTS, [Task("a")], env)
+    planner.plan_to_next_operators()
+    assert [oe.operator.name for oe in planner.get_next_operator_execs()] == ["a"]
+    assert env.log == []
+
+
+def test_root_operator_with_multiple_matches():
+    N = Var(Num, "N")
+
+    class NumEnv(Env):
+        def get_state(self):
+            return [{"type": "Num", "id": "1", "n": 1},
+                    {"type": "Num", "id": "2", "n": 2}]
+
+    planner = make(HTN(Operator("pick", N, pre=N.n > 0)), [Task("pick", Var(Num, "M"))], NumEnv())
+    planner.plan_to_next_operators()
+    op_execs = planner.get_next_operator_execs()
+    assert sorted(oe.match[0].n for oe in op_execs) == [1, 2]
+    planner.apply(op_execs[1])
+    assert planner.is_exhausted()
 
 
 @pytest.mark.parametrize("root", [
@@ -268,24 +335,6 @@ def test_tree_to_dict_and_str():
 # ------------------------------------------------------
 # : Known bugs
 
-@pytest.mark.xfail(strict=True, raises=IndexError, reason=(
-    "_attempt_conflict_set() indexes an empty list when a root task "
-    "completes without reaching any operator."))
-def test_root_task_with_empty_method():
-    env = Env()
-    run_stepwise(make(HTN(*ops, Method("S", subtasks=[])), [Task("S")], env))
-    assert env.log == []
-
-
-@pytest.mark.xfail(strict=True, raises=AttributeError, reason=(
-    "A root task that is an operator: Cursor.advance_subtask() pops to an "
-    "empty stack and then calls next_frame_after_commit() on None."))
-def test_root_task_is_operator():
-    env = Env()
-    run_stepwise(make(HTN(*ops), [Task("a")], env))
-    assert env.log == ["a"]
-
-
 @pytest.mark.xfail(strict=True, raises=UnboundLocalError, reason=(
     "Single-headed planning is unfinished: plan(multiheaded=False) "
     "references an undefined `child_exec`, and never checks stop_kinds."))
@@ -350,9 +399,6 @@ def test_task_with_no_matches_backtracks():
     assert [oe.operator.name for oe in planner.get_next_operator_execs()] == ["b"]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "Trace.get_current_plan() looks for entry_type == 'operator' instead "
-    "of TraceKind.APPLY_OPERATOR, so it always returns []."))
 def test_get_current_plan():
     htn = HTN(*ops, Method("S", subtasks=[Task("a"), Task("b")]))
     planner = make(htn, [Task("S")], Env())
@@ -360,15 +406,83 @@ def test_get_current_plan():
     assert [oe.operator.name for oe in planner.get_current_plan()] == ["a", "b"]
 
 
-@pytest.mark.parametrize("call", [
-    lambda p: p.get_next_method_execs(),
-    lambda p: p.get_current_root(),
-    lambda p: p.clear_tasks(),
-], ids=["get_next_method_execs", "get_current_root", "clear_tasks"])
-@pytest.mark.xfail(strict=True, raises=AttributeError, reason=(
-    "Uses self.cursor, which HTN_Planner replaced with self.cursors."))
-def test_cursor_accessors(call):
+def test_get_current_plan_stepwise_across_roots():
+    planner = make(ROOTS, [Task("S"), Task("T")], Env())
+    run_stepwise(planner)
+    assert [oe.operator.name for oe in planner.get_current_plan()] == ["a", "b"]
+
+
+def test_current_plan_excludes_failed_operators():
+    htn = HTN(*ops, Method("S", subtasks=[Task("a")]))
+    planner = make(htn, [Task("S")], Env(fail={"a"}))
+    planner.plan_to_next_operators()
+    planner.apply(planner.get_next_operator_execs()[0])
+    assert planner.get_current_plan() == []
+
+
+def test_one_trace_records_the_whole_run():
+    planner = make(ROOTS, [Task("S"), Task("T")], Env())
+    trace = planner.trace
+    run_stepwise(planner)
+    assert planner.trace is trace
+    kinds = [e.kind for e in trace.entries]
+    assert kinds.count(TraceKind.NEW_ROOT_TASK) == 2
+    assert kinds.count(TraceKind.APPLY_OPERATOR) == 2
+
+
+def test_print_current_plan(capsys):
+    htn = HTN(*ops, Method("S", subtasks=[Task("a"), Task("b")]))
+    planner = make(htn, [Task("S")], Env())
+    planner.plan(multiheaded=True)
+    planner.print_current_plan()
+    out = capsys.readouterr().out
+    assert "Step 01: OperatorEx('a')" in out
+    assert "Step 02: OperatorEx('b')" in out
+
+
+# ------------------------------------------------------
+# : Inspecting and resetting the planner
+
+def test_get_current_root():
+    htn = HTN(*ops, Method("S", subtasks=[Task("a")]))
+    planner = make(htn, [Task("S")], Env())
+    assert planner.get_current_root() is None
+    planner.plan_to_next_operators()
+    root = planner.get_current_root()
+    assert root.task.name == "S"
+
+
+def test_get_next_method_execs():
     htn = HTN(*ops, Method("S", subtasks=[Task("a")]))
     planner = make(htn, [Task("S")], Env())
     planner.plan_to_next_operators()
-    call(planner)
+    task_exec, child_execs = planner.get_next_method_execs()
+    assert task_exec.task.name == "a"
+    assert [ce.operator.name for ce in child_execs] == ["a"]
+
+
+def test_clear_tasks():
+    env = Env()
+    planner = make(ROOTS, [Task("S"), Task("T")], env)
+    planner.plan_to_next_operators()
+    planner.clear_tasks()
+    assert planner.is_exhausted()
+    assert planner.get_current_root() is None
+
+
+def test_reset_drops_current_root_but_keeps_queue():
+    env = Env()
+    planner = make(ROOTS, [Task("S"), Task("T")], env)
+    planner.plan_to_next_operators()
+    planner.reset()
+    run_stepwise(planner)
+    assert env.log == ["b"]
+
+
+def test_print_planner_state(capsys):
+    planner = make(ROOTS, [Task("S"), Task("T")], Env())
+    planner.plan_to_next_operators()
+    planner.print_planner_state()
+    out = capsys.readouterr().out
+    assert "Queued root tasks: 1" in out
+    assert "Cursors: 1" in out

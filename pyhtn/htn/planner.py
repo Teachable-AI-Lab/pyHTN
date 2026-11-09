@@ -562,6 +562,13 @@ class Cursor:
         # print("CF:", self.current_frame)
         task_ind = self.current_frame.task_ind
         curr_frame = self._pop_frame()
+
+        # A root task that is itself an operator has no parent frame, so
+        #  applying it finishes the root task.
+        if(curr_frame is None):
+            if(trace):
+                trace.add(TraceKind.POP_FRAME, None, None)
+            return
         # curr_frame.current_method_exec.subtask_execs[task_ind].status = ExStatus.SUCCESS
         # print(" ::", curr_frame, curr_frame.current_method_exec)
         # print("\t->>", curr_frame.current_method_exec.subtask_execs[task_ind])
@@ -795,7 +802,7 @@ class Cursor:
         if(task_exec is None):
             task_frame = self.current_frame
         else:
-            for frame in [self.current_frame, self.stack]:
+            for frame in [self.current_frame, *self.stack]:
                 if(task_exec is frame.current_task_exec):
                     task_frame = frame
                     break
@@ -918,38 +925,37 @@ class RootTaskQueue(TaskManager):
             self.add(task)
         
 
+    PRIORITY_RANKS = {'first': 0, 'high': 1, 'medium': 2, 'low': 3}
+
+    @classmethod
+    def _priority_rank(cls, priority):
+        if(isinstance(priority, (int, float))):
+            return priority
+        if(priority not in cls.PRIORITY_RANKS):
+            raise ValueError(
+                f"Unknown task priority {priority!r}; expected a number or "
+                f"one of {list(cls.PRIORITY_RANKS)}.")
+        return cls.PRIORITY_RANKS[priority]
+
     def add(self, task: Union[dict, tuple, Task]):
+        ''' Queue a root task. Tasks are ordered by priority (a lower rank
+            runs sooner), and tasks with the same priority run in the order
+            they were added.
+        '''
         if(isinstance(task, dict)):
             task = Task(**task)
         elif(isinstance(task, tuple)):
             task = Task(*task)
-            
-        if task.priority == 'first' or self.is_empty():
-            self.queue.insert(0, task)
-            if self.enable_logging:
-                self.logger.info(f"Added task {task} as first task")
-        else:
-            priority_map = {'first': 0, 'high': 1, 'medium': 2, 'low': 3}
-            task_priority = priority_map.get(task.priority)
 
-            for i, existing_task in enumerate(self.queue):
-                existing_priority = existing_task.tasks.priority
-                if isinstance(existing_priority, str):
-                    existing_priority = priority_map.get(existing_priority, 3)
+        rank = self._priority_rank(task.priority)
 
-                if task_priority < existing_priority:
-                    pos = i
-                    self.queue.insert(i, task)
-                else:
-                    pos = i + 1
-                self.queue.insert(pos, task)
-                if self.enable_logging:
-                    self.logger.info(f"Added task {task} at position {pos} with priority {task.priority}")
-                return
-
-            self.queue.append(task)
-            if self.enable_logging:
-                self.logger.info(f"Added task {task} at the end with priority {task.priority}")
+        # Insert after every queued task with the same or a sooner rank.
+        pos = len(self.queue)
+        for i, queued in enumerate(self.queue):
+            if(rank < self._priority_rank(queued.priority)):
+                pos = i
+                break
+        self.queue.insert(pos, task)
 
     def get_next_task(self) -> Task:
         if(self.is_empty()):
@@ -1038,7 +1044,8 @@ class HTN_Planner:
         self.domain_network = HTN.coerce(domain)
 
         # Create cursor to track planning state
-        self.cursors = [Cursor()]
+        # Cursors share the planner's trace so it records the whole run.
+        self.cursors = [Cursor(self.trace)]
 
         if self.enable_logging:
             self.logger.info(f"Domain network built with {len(domain)} task types")
@@ -1122,13 +1129,25 @@ class HTN_Planner:
 
         task_exec = root_task.as_task_exec(self.state)
         child_execs, trace_kind = self._expand_taskex(task_exec, None, cursor, push_nomatch_frame)
-        cursor.push_task_exec(self.state, task_exec, None, child_execs, trace=trace)
 
         trace.add(TraceKind.NEW_ROOT_TASK, task_exec)
         if(trace_kind is not None):
             trace.add(trace_kind, task_exec)
-        
+
+        # A root task that is an operator: give each matching OperatorEx its
+        #  own cursor, as expanding a subtask into operators does.
+        if(child_execs and isinstance(child_execs[0], OperatorEx)):
+            self.cursors = []
+            for child_exec in child_execs:
+                op_cursor = cursor.copy()
+                op_cursor.push_task_exec(self.state, task_exec, None, [child_exec], trace=trace)
+                child_exec.cursor = op_cursor
+                self.cursors.append(op_cursor)
+            return TraceKind.EXPAND_TO_OPERATOR
+
+        cursor.push_task_exec(self.state, task_exec, None, child_execs, trace=trace)
         self.cursors = [cursor]
+        return None
 
 
     def plan(self, multiheaded=False, stop_kinds=[], push_nomatch_frame=False) -> List:
@@ -1142,7 +1161,8 @@ class HTN_Planner:
             if(all(cursor.is_at_end() for cursor in self.cursors)):
                 # If all cursors exhausted, create a new cursor by popping off a new root task
                 if(not self.root_task_queue.is_empty()):
-                    self._pop_next_root_task(push_nomatch_frame)
+                    if(self._pop_next_root_task(push_nomatch_frame) in stop_kinds):
+                        return self.trace
 
                 # But if no more root tasks terminate
                 else:
@@ -1289,7 +1309,13 @@ class HTN_Planner:
                 self.cursors = halted_cursors
                 break; 
 
-            # if(self.env is not None):
+            # If planning ran out of work without reaching any operator
+            #  (e.g. the root's method has no subtasks), the root task is
+            #  done. Leave a finished cursor so the loop moves on to the
+            #  next root task.
+            if(len(operator_cursors) == 0):
+                cursors = self.cursors = [Cursor(self.cursors[0].trace)]
+                continue
 
             operator_cursors = operator_cursors[::-1]
             # print("OPERATOR CURSORS:", [c.current_frame.current_operator_exec.operator.name for c in operator_cursors])
@@ -1603,23 +1629,23 @@ class HTN_Planner:
         if self.enable_logging:
             self.logger.log_function()
         print("===== PLANNER STATE =====")
-        print(f"Root tasks: {len(self.root_task_execs)}")
-        if not self.root_task_queue.is_empty():
-            for i, task in enumerate(self.root_task_queue.queue):
-                print(f"  Task {i}: {task.name} (status: {task.status})")
+        print(f"Queued root tasks: {len(self.root_task_queue)}")
+        for i, task in enumerate(self.root_task_queue.queue):
+            print(f"  Task {i}: {task}")
 
-        cursor = self.cursors[0]
-
-        print(f"Current task: {cursor.current_task.name if cursor.current_task else None}")
-        print(f"Current method: {cursor.current_method.name if cursor.current_method else None}")
-        print(f"Current subtask index: {cursor.current_subtask_ind}")
-        print(f"Available methods: {len(cursor.available_method_execs)}")
-        print(f"Current method index: {cursor.current_method_ind}")
-        print(f"Stack depth: {len(cursor.stack)}")
+        print(f"Cursors: {len(self.cursors)}")
+        for i, cursor in enumerate(self.cursors):
+            if(cursor.is_at_end()):
+                print(f"  Cursor {i}: at end")
+                continue
+            frame = cursor.current_frame
+            print(f"  Cursor {i}: task={frame.current_task_exec}, "
+                  f"child={frame.current_child_exec}, "
+                  f"stack depth={len(cursor.stack)}")
 
         print(f"Trace entries: {len(self.trace.entries)}")
         for i, entry in enumerate(self.trace.entries[-5:]):  # Show last 5 entries
-            print(f"  Entry {i}: type={entry.entry_type}")
+            print(f"  Entry {i}: kind={entry.kind}")
 
         print("=========================")
 
@@ -1663,17 +1689,27 @@ class HTN_Planner:
         if self.enable_logging:
             self.logger.log_function()
         self.root_task_queue.clear()
-        self.cursor.reset()
+        self.cursors = [Cursor(self.cursors[0].trace)]
+
+    @property
+    def cursor(self):
+        ''' The primary cursor. The interactive interface assumes a single
+            cursor; multiheaded planning can leave several, all within the
+            same root task.
+        '''
+        return self.cursors[0]
 
     def get_current_root(self):
-        """Gets the current root."""
+        """Gets the root TaskEx currently being planned, or None."""
         if self.enable_logging:
             self.logger.log_function()
 
-        if(len(self.cursor.stack) > 0):
-            return self.cursor.stack[0].task_exec
-        else:
-            return self.cursor.current_frame.task_exec
+        cursor = self.cursor
+        if(cursor.is_at_end()):
+            return None
+        if(len(cursor.stack) > 0):
+            return cursor.stack[0].task_exec
+        return cursor.current_frame.task_exec
 
     def get_current_plan(self):
         """Gets the current plan."""
@@ -1702,8 +1738,7 @@ class HTN_Planner:
         if self.enable_logging:
             self.logger.log_function()
         self.trace = Trace()
-        self.cursor = Cursor()
-        self.root_task_execs = []
+        self.cursors = [Cursor(self.trace)]
 
 # --------------------------------------------
 # : Interactive Interface
@@ -1730,7 +1765,7 @@ class HTN_Planner:
     def get_next_operator_execs(self):
         operator_cursors = []
         for cursor in self.cursors:
-            if(cursor.is_operator_frame):
+            if(not cursor.is_at_end() and cursor.is_operator_frame):
                 operator_cursors.append(cursor.current_operator_exec)
         return operator_cursors
 
@@ -1746,7 +1781,7 @@ class HTN_Planner:
             raise ValueError(f"MethodEx stage {method_exec} fail." +
                 "Not a possible MethodEx for this state")
 
-        self.cursor.user_select_method_exec(inds[0], self.trace)
+        self.cursor.user_select_method_exec(self.state, inds[0], self.trace)
     
     def add_method_exec(self, method_exec, task_exec=None):
         self.cursor.add_method_exec(method_exec, task_exec, self.trace)

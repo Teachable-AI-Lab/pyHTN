@@ -256,7 +256,10 @@ planner = HTN_Planner(htn, tasks=[Task("move", "a", "c")], env=env,
 ```
 
 Root tasks can be given as `Task`s, as `(name, *args)` tuples, or as
-`{"name": ..., "args": [...]}` dicts.
+`{"name": ..., "args": [...]}` dicts. They run in order of `priority`
+(`"first"`, `"high"`, `"medium"`, `"low"`, or a number; lower runs sooner,
+default `"first"`), and tasks with the same priority run in the order they
+were added. A root task may be a method task or an operator.
 
 | Method | Description |
 |---|---|
@@ -268,6 +271,12 @@ Root tasks can be given as `Task`s, as `(name, *args)` tuples, or as
 | `add_tasks(tasks)` | Add root tasks. |
 | `add_method(method, task=None)` | Add a method to the HTN. |
 | `get_prev_operator_exec()` | The last operator execution applied. |
+| `get_current_plan()` | The operator executions applied so far, in order (failed ones excluded). |
+| `print_current_plan()` | Print the operators applied so far. |
+| `get_current_root()` | The root `TaskEx` being planned, or `None`. |
+| `clear_tasks()` | Drop all queued root tasks and the one in progress. |
+| `reset()` | Drop the root task in progress and start a new trace. Queued root tasks are kept. |
+| `print_planner_state()` | Print the queued root tasks and cursors. |
 | `print_current_frames()` | Print the current planning frames. |
 | `print_network()` | Print the HTN. |
 | `print_current_trace()` | Print the execution trace. |
@@ -285,13 +294,10 @@ These are tracked by `xfail` tests in `tests/test_planner.py`:
   back to the task's next method.
 - **Tasks with no matches:** a task with no matching method or operator
   raises an error instead of backtracking.
-- **Single-headed and interactive planning:** `plan(multiheaded=False)`,
-  `plan_to_next_decomposition()`, `get_next_method_execs()`,
-  `stage_method_exec()`, `get_current_root()` and `clear_tasks()` don't
-  work yet.
-- **Root tasks:** they currently run in reverse order. A root task that is
-  an operator, or whose method has no subtasks, raises an error.
-- **`get_current_plan()`** always returns `[]`.
+- **Single-headed and interactive planning:** `plan(multiheaded=False)` and
+  `plan_to_next_decomposition()` don't work yet, so the interactive
+  method-selection calls (`get_next_method_execs()`, `stage_method_exec()`,
+  `add_method_exec()`) can't be used as intended.
 
 ## Running the Tests
 

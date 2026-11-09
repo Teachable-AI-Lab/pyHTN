@@ -162,11 +162,8 @@ class Trace:
         Get the current plan consisting of successful operator executions.
         Returns a list of operators in the order they were executed.
         """
-        plan = []
-        for entry in self.entries:
-            if entry.entry_type == "operator": #and getattr(entry, "success", False):
-                plan.append(entry.operator_exec)
-        return plan
+        return [entry.operator_exec for entry in self.entries
+                if entry.kind == TraceKind.APPLY_OPERATOR]
 
 
     def get_prev_entry(self):
